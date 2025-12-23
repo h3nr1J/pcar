@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.23
+playwright>=1.47
+pydantic>=2
+2captcha-python>=1.2.0
+capmonstercloudclient>=3.3.0

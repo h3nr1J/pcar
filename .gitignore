@@ -1,0 +1,26 @@
+git remote -v
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+
+# Environments
+venv/
+.venv/
+env/
+.env
+.env.*
+__pycache__/
+*.pyc
+
+# Playwright
+ms-playwright/
+playwright-report/
+
+# Debug artifacts
+tmp_*.html
+tmp_*.txt
+tmp_*.png
+
+
