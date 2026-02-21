@@ -4,7 +4,7 @@ import io
 from fastapi import HTTPException
 from PIL import Image
 
-from services.sunarp import solve_captcha_with_openai
+from services.sunarp import solve_captcha_with_capmonster
 
 URL_SAT_CALLAO = "https://pagopapeletascallao.pe/buscar"
 
@@ -61,7 +61,7 @@ async def consulta_satcallao(placa: str, browser):
 
     # Captcha base64
     captcha_b64 = await _get_captcha_b64(page)
-    captcha_text = await solve_captcha_with_openai(captcha_b64)
+    captcha_text = await solve_captcha_with_capmonster(captcha_b64)
 
     captcha_input = page.locator("#captcha")
     if not await captcha_input.count():

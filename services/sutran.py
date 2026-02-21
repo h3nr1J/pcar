@@ -4,7 +4,7 @@ import base64
 from fastapi import HTTPException
 from PIL import Image
 
-from services.sunarp import solve_captcha_with_openai
+from services.sunarp import solve_captcha_with_capmonster
 
 SUTRAN_URL = "https://www.sutran.gob.pe/consultas/record-de-infracciones/record-de-infracciones/"
 
@@ -107,7 +107,7 @@ async def consulta_sutran(placa: str, browser):
     await placa_input.fill(placa)
 
     captcha_b64 = await _get_captcha_image_base64(page)
-    captcha_text = await solve_captcha_with_openai(captcha_b64)
+    captcha_text = await solve_captcha_with_capmonster(captcha_b64)
 
     captcha_input = await _get_captcha_input(frame)
     if not captcha_input:

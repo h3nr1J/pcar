@@ -2,8 +2,8 @@ import os
 
 from fastapi import HTTPException
 
-# Reutilizamos el lector de captchas que ya tienes en SUNARP
-from services.sunarp import solve_captcha_with_openai
+# Reutilizamos el solver de captchas con CapMonster
+from services.sunarp import solve_captcha_with_capmonster
 
 
 # URL oficial de consulta CITV (MTC)
@@ -135,7 +135,7 @@ async def consulta_revision(placa: str, browser):
     - Asegurar tipo de búsqueda = Placa (si aplica)
     - Rellenar placa
     - Leer captcha (base64 del <img>)
-    - Enviar a OpenAI para OCR
+    - Resolver captcha con CapMonster
     - Rellenar captcha
     - Click en Buscar
     - Leer resultados
@@ -173,8 +173,8 @@ async def consulta_revision(placa: str, browser):
     # 4) Captcha → base64 (desde el src de imgCaptcha)
     captcha_b64 = await _get_captcha_base64(page)
 
-    # 5) Resolver captcha con OpenAI (reutilizamos tu función de SUNARP)
-    captcha_text = await solve_captcha_with_openai(captcha_b64)
+    # 5) Resolver captcha con CapMonster (reutilizamos la función de SUNARP)
+    captcha_text = await solve_captcha_with_capmonster(captcha_b64)
 
     # 6) Input de captcha
     captcha_input = await _get_captcha_input(page)

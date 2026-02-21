@@ -10,20 +10,33 @@ from PIL import Image
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from capmonstercloudclient import CapMonsterClient, ClientOptions
-from capmonstercloudclient.requests import TurnstileRequest
-from services.buscardniperu import consulta_dni_por_nombres
+from capmonstercloudclient.requests import TurnstileRequest, ImageToTextRequest
 
 # ========= CONFIG .env =========
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta OPENAI_API_KEY en el .env")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+_openai_client: OpenAI | None = None
 
 _capmonster_client: CapMonsterClient | None = None
 _capmonster_api_key: str | None = None
+_sunarp_extraer_propietarios = (
+    (os.getenv("SUNARP_EXTRAER_PROPIETARIOS") or "0").strip().lower() in {"1", "true", "yes", "si"}
+)
+
+
+def _get_openai_client() -> OpenAI | None:
+    global _openai_client
+    if _openai_client:
+        return _openai_client
+    api_key = (os.getenv("OPENAI_API_KEY") or OPENAI_API_KEY or "").strip()
+    if not api_key:
+        return None
+    try:
+        _openai_client = OpenAI(api_key=api_key)
+    except Exception:
+        _openai_client = None
+    return _openai_client
 
 
 def _get_capmonster_client() -> CapMonsterClient | None:
@@ -517,8 +530,6 @@ async def _extract_turnstile_params(page) -> dict:
         return out
     except Exception:
         return {"sitekey": None, "action": None, "cdata": None}
-
-
 async def _extract_turnstile_sitekey_from_assets(page) -> str | None:
     """
     Intenta extraer el sitekey desde los assets JS cargados por la SPA.
@@ -769,38 +780,65 @@ async def _wait_sunarp_submit_outcome(page, timeout_ms: int = 15000):
     return ("captcha", None)
 
 
-# ============== HELPER OPENAI ==============
+# ============== HELPERS CAPTCHA ==============
 
-async def solve_captcha_with_openai(captcha_b64: str) -> str:
+def _captcha_variants_for_ocr(captcha_b64: str) -> list[bytes]:
     """
-    Envía el captcha (base64) a OpenAI y devuelve SOLO el texto del captcha.
+    Devuelve variantes de la imagen para mejorar tasa de acierto OCR.
     """
-    data_url = f"data:image/png;base64,{captcha_b64}"
+    if captcha_b64.startswith("data:"):
+        captcha_b64 = captcha_b64.split("base64,", 1)[-1]
 
-    def _call():
-        resp = client.responses.create(
-            model="gpt-4.1",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Lee el captcha y devuelve solo el texto."},
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }
-            ],
-            instructions="Solo el texto del captcha, sin espacios ni saltos.",
-        )
-        return resp.output_text
+    raw = base64.b64decode(captcha_b64)
+    variants = [raw]
 
     try:
-        raw = await asyncio.to_thread(_call)
-    except Exception as e:
-        print("Error al llamar a OpenAI para captcha:", e)
-        raise HTTPException(status_code=500, detail="Error resolviendo captcha con OpenAI")
+        gray = Image.open(io.BytesIO(raw)).convert("L")
+        upscaled = gray.resize((gray.width * 2, gray.height * 2), resample=Image.BICUBIC)
+        out = io.BytesIO()
+        upscaled.save(out, format="PNG")
+        variants.append(out.getvalue())
+    except Exception:
+        pass
 
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-    return cleaned
+    return variants
+
+
+async def solve_captcha_with_capmonster(captcha_b64: str) -> str:
+    """
+    Resuelve captcha de imagen (texto) usando CapMonster ImageToText.
+    """
+    capmonster_client = _get_capmonster_client()
+    if not capmonster_client:
+        raise HTTPException(
+            status_code=500,
+            detail="Falta CAPMONSTER_API_KEY para resolver captcha de imagen",
+        )
+
+    for img_bytes in _captcha_variants_for_ocr(captcha_b64):
+        req = ImageToTextRequest(
+            image_bytes=img_bytes,
+            module_name="universal",
+            numeric=0,
+            case=False,
+            math=False,
+        )
+        try:
+            solution = await asyncio.wait_for(capmonster_client.solve_captcha(req), timeout=15)
+        except Exception:
+            continue
+
+        raw = (
+            (solution or {}).get("text")
+            or (solution or {}).get("answer")
+            or (solution or {}).get("code")
+            or ""
+        )
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", str(raw)).upper()
+        if cleaned:
+            return cleaned
+
+    raise HTTPException(status_code=500, detail="CapMonster no pudo resolver captcha de imagen")
 
 
 def _parse_propietario_nombre(nombre: str) -> dict:
@@ -858,6 +896,10 @@ async def extract_propietarios_from_image(image_b64: str) -> list[str]:
         # data:image/png;base64,<...>
         image_b64 = image_b64.split("base64,", 1)[-1]
 
+    client = _get_openai_client()
+    if not client:
+        return []
+
     data_url = f"data:image/png;base64,{image_b64}"
 
     def _call():
@@ -867,12 +909,21 @@ async def extract_propietarios_from_image(image_b64: str) -> list[str]:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Devuelve solo los nombres de propietario, uno por línea."},
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Extrae únicamente los nombres completos de propietario(s) que aparecen "
+                                "en la imagen SUNARP. Si hay más de uno, devuelve uno por línea."
+                            ),
+                        },
                         {"type": "input_image", "image_url": data_url},
                     ],
                 }
             ],
-            instructions="Solo nombres, uno por línea. Sin prefijos ni comentarios.",
+            instructions=(
+                "Responde solo con nombres de personas o razón social propietaria, "
+                "uno por línea, sin numeración, sin etiquetas, sin comentarios."
+            ),
         )
         return resp.output_text
 
@@ -883,16 +934,40 @@ async def extract_propietarios_from_image(image_b64: str) -> list[str]:
         return []
 
     propietarios: list[str] = []
+    vistos: set[str] = set()
+    basura = (
+        "PLACA",
+        "PARTIDA",
+        "MODELO",
+        "MOTOR",
+        "SERIE",
+        "VIN",
+        "TARJETA",
+        "ASIENTO",
+        "REGISTRO",
+        "SUNARP",
+        "PROPIETARIO",
+    )
     for line in raw.replace(";", "\n").splitlines():
-        clean = line.strip().strip(":").strip()
-        if clean:
-            propietarios.append(clean.upper())
+        clean = re.sub(r"\s+", " ", (line or "").strip(" :\t\r\n")).upper()
+        if len(clean) < 3:
+            continue
+        if any(b in clean for b in basura):
+            continue
+        if re.search(r"\d{5,}", clean):
+            continue
+        if not re.fullmatch(r"[A-Z0-9ÁÉÍÓÚÜÑ.,'\- ]+", clean):
+            continue
+        if clean in vistos:
+            continue
+        vistos.add(clean)
+        propietarios.append(clean)
     return propietarios
 
 
 # ============== FUNCIÓN PRINCIPAL ==============
 
-async def consulta_sunarp(placa: str, browser):
+async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None = None):
     """
     Hace TODO el flujo de SUNARP.
     Es básicamente tu antiguo endpoint /consulta-vehicular,
@@ -932,7 +1007,7 @@ async def consulta_sunarp(placa: str, browser):
     captcha_input = await get_captcha_input(page)
     if captcha_input:
         captcha_b64 = await get_captcha_image_base64(page)
-        captcha_text = await solve_captcha_with_openai(captcha_b64)
+        captcha_text = await solve_captcha_with_capmonster(captcha_b64)
         await captcha_input.fill(captcha_text)
 
     # 4) CLICK EN EL BOTÓN "Realizar Búsqueda"
@@ -1019,47 +1094,16 @@ async def consulta_sunarp(placa: str, browser):
 
     await context.close()
 
-    # Si todo bien, devolvemos texto e imagen
-    propietarios = await extract_propietarios_from_image(result_img_src) if result_img_src else []
+    should_extract_propietarios = (
+        _sunarp_extraer_propietarios if extraer_propietarios is None else bool(extraer_propietarios)
+    )
+
+    # Si todo bien, devolvemos texto e imagen.
+    # Por defecto NO extraemos propietarios para evitar latencia extra.
+    propietarios = []
+    if should_extract_propietarios and result_img_src:
+        propietarios = await extract_propietarios_from_image(result_img_src)
     propietarios_detalle = [_parse_propietario_nombre(p) for p in propietarios]
-
-    # Intento opcional: obtener DNI del primer propietario usando buscardniperu.com
-    buscardni_res = None
-    primer_dni = None
-    propietario_para_dni = None
-    coincidencias_propietario = []
-    try:
-        for det in propietarios_detalle:
-            ap_pat = (det.get("ap_paterno") or "").strip()
-            ap_mat = (det.get("ap_materno") or "").strip()
-            nombres = (det.get("nombres") or "").strip()
-            if ap_pat and ap_mat and nombres:
-                propietario_para_dni = {"ap_paterno": ap_pat, "ap_materno": ap_mat, "nombres": nombres}
-                buscardni_res = await consulta_dni_por_nombres(ap_pat, ap_mat, nombres, browser)
-                try:
-                    resultados = buscardni_res.get("resultados") or []
-                    # Coincidencias exactas con el propietario (mismo nombre y apellidos)
-                    def _norm(s: str) -> str:
-                        return (s or "").strip().upper()
-
-                    coincidencias_propietario = [
-                        r
-                        for r in resultados
-                        if _norm(r.get("ap_paterno")) == _norm(ap_pat)
-                        and _norm(r.get("ap_materno")) == _norm(ap_mat)
-                        and _norm(r.get("nombres")) == _norm(nombres)
-                    ]
-                    fuente = coincidencias_propietario or resultados
-                    if fuente:
-                        primer_dni = (fuente[0].get("dni") or "").strip() or None
-                except Exception:
-                    primer_dni = None
-                    coincidencias_propietario = []
-                break
-    except HTTPException as e:
-        buscardni_res = {"ok": False, "error": e.detail, "status": e.status_code}
-    except Exception as e:
-        buscardni_res = {"ok": False, "error": str(e)}
 
     return {
         "ok": True,
@@ -1070,8 +1114,30 @@ async def consulta_sunarp(placa: str, browser):
         "imagen_resultado_src": result_img_src,
         "propietarios": propietarios,
         "propietarios_detalle": propietarios_detalle,
-        "dni_propietario_buscar": buscardni_res,
-        "dni_propietario": primer_dni,
-        "dni_propietario_coincidentes": coincidencias_propietario,
-        "propietario_usado_para_dni": propietario_para_dni,
+        "propietarios_extraidos": should_extract_propietarios,
     }
+
+
+async def enriquecer_resultado_sunarp_con_propietarios(data: dict | None) -> dict:
+    """
+    Toma un resultado de `consulta_sunarp` y completa propietarios desde la imagen
+    usando OpenAI, solo si aún no existen.
+    """
+    out = dict(data or {})
+    propietarios_detalle = out.get("propietarios_detalle") or []
+    if propietarios_detalle:
+        out["propietarios_extraidos"] = True
+        return out
+
+    src = (out.get("imagen_resultado_src") or "").strip()
+    if not src:
+        out.setdefault("propietarios", [])
+        out.setdefault("propietarios_detalle", [])
+        out["propietarios_extraidos"] = False
+        return out
+
+    propietarios = await extract_propietarios_from_image(src)
+    out["propietarios"] = propietarios
+    out["propietarios_detalle"] = [_parse_propietario_nombre(p) for p in propietarios]
+    out["propietarios_extraidos"] = True
+    return out

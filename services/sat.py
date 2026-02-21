@@ -5,7 +5,7 @@ import base64
 from fastapi import HTTPException
 from PIL import Image
 
-from services.sunarp import solve_captcha_with_openai
+from services.sunarp import solve_captcha_with_capmonster
 
 # Página específica de captura de vehículos (versión actual)
 # Se puede sobreescribir con URL_SAT_CAPTURA en .env si cambia el path.
@@ -123,7 +123,7 @@ async def consulta_sat(placa: str, browser):
 
     # 2) Captcha
     captcha_b64 = await _get_captcha_image_base64(page)
-    captcha_text = await solve_captcha_with_openai(captcha_b64)
+    captcha_text = await solve_captcha_with_capmonster(captcha_b64)
 
     captcha_input = await _get_captcha_input(page)
     if not captcha_input:

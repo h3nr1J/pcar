@@ -9,7 +9,6 @@ from time import monotonic
 from fastapi import HTTPException
 from PIL import Image, ImageFilter, ImageOps
 from dotenv import load_dotenv, find_dotenv
-from openai import OpenAI
 from capmonstercloudclient import CapMonsterClient, ClientOptions
 from capmonstercloudclient.requests import ImageToTextRequest
 
@@ -18,7 +17,6 @@ load_dotenv()
 
 # URL del Sistema de Licencias por puntos (MTC)
 URL_LICENCIA = "https://slcp.mtc.gob.pe/"
-_client_lic = OpenAI()
 
 _capmonster_client: CapMonsterClient | None = None
 _capmonster_api_key: str | None = None
@@ -29,6 +27,9 @@ _capmonster_api_key: str | None = None
 
 LICENCIA_SESSION_TTL_SEC = int(os.getenv("LICENCIA_SESSION_TTL_SEC", "120"))
 LICENCIA_SESSION_MAX = int(os.getenv("LICENCIA_SESSION_MAX", "50"))
+LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS = int(
+    os.getenv("LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS", "3")
+)
 
 
 @dataclass
@@ -453,18 +454,27 @@ def _prepare_captcha_for_ocr(captcha_b64: str, mode: str = "original") -> bytes:
     return out.getvalue()
 
 
-async def _solve_captcha_with_capmonster(captcha_b64: str) -> str | None:
+async def _solve_captcha_candidates_with_capmonster(
+    captcha_b64: str, max_candidates: int = 3
+) -> list[str]:
     """
-    Resuelve captcha numérico del MTC usando CapMonster ImageToText.
-    Devuelve 6 dígitos o None si no fue posible.
+    Obtiene varios candidatos de 6 dígitos para un mismo captcha usando
+    distintas preprocesadas + parámetros de CapMonster.
     """
     client = _get_capmonster_client()
     if not client:
-        return None
+        return []
 
-    # Orden importa: muchas veces el captcha es más legible en escala de grises reescalada.
-    # No conviene demorar mucho entre captura y submit porque el captcha puede expirar.
-    for mode in ("gray",):
+    plan: list[tuple[str, int | None]] = [
+        ("original", None),
+        ("gray", None),
+        ("bin", None),
+        ("gray", 92),
+        ("bin", 118),
+    ]
+
+    candidates: list[str] = []
+    for mode, threshold in plan:
         try:
             img_bytes = _prepare_captcha_for_ocr(captcha_b64, mode=mode)
             req = ImageToTextRequest(
@@ -473,64 +483,34 @@ async def _solve_captcha_with_capmonster(captcha_b64: str) -> str | None:
                 numeric=1,
                 case=False,
                 math=False,
+                threshold=threshold,
+                no_cache=True,
             )
-            solution = await asyncio.wait_for(client.solve_captcha(req), timeout=6)
-            raw = (
-                (solution or {}).get("text")
-                or (solution or {}).get("answer")
-                or (solution or {}).get("code")
-                or ""
-            )
-            digits = _clean_6_digits(str(raw))
-            if len(digits) == 6:
-                return digits
+            solution = await asyncio.wait_for(client.solve_captcha(req), timeout=10)
         except Exception:
             continue
 
-    return None
-
-
-async def _solve_captcha_strong(captcha_b64: str) -> str:
-    """
-    Usa un modelo más fuerte para mejorar acierto de captcha.
-    """
-    model = os.getenv("LICENCIA_CAPTCHA_OPENAI_MODEL", "gpt-4.1")
-
-    def _call(img_bytes: bytes) -> str:
-        data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("utf-8")
-        resp = _client_lic.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Lee el captcha. Responde SOLO con los 6 dígitos exactos (0-9).",
-                        },
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }
-            ],
-            instructions="Devuelve únicamente 6 dígitos. Si no puedes leerlos con seguridad, responde vacío.",
+        raw = (
+            (solution or {}).get("text")
+            or (solution or {}).get("answer")
+            or (solution or {}).get("code")
+            or ""
         )
-        return resp.output_text or ""
-
-    # Variante 1: la misma preparación que usamos para CapMonster (suele limpiar ruido)
-    processed = _prepare_captcha_for_ocr(captcha_b64, mode="gray")
-    # Variante 2: original (a veces el pre-procesado empeora)
-    original = base64.b64decode(captcha_b64)
-
-    for img_bytes in (processed, original):
-        try:
-            raw = await asyncio.wait_for(asyncio.to_thread(_call, img_bytes), timeout=15)
-        except Exception:
+        digits = _clean_6_digits(str(raw))
+        if len(digits) != 6 or digits in candidates:
             continue
-        cleaned = _clean_6_digits(raw)
-        if len(cleaned) == 6:
-            return cleaned
+        candidates.append(digits)
+        if len(candidates) >= max(1, max_candidates):
+            break
 
-    return ""
+    return candidates
+
+
+async def _solve_captcha_with_capmonster(captcha_b64: str) -> str | None:
+    candidates = await _solve_captcha_candidates_with_capmonster(captcha_b64, max_candidates=1)
+    if not candidates:
+        return None
+    return candidates[0]
 
 
 async def _parse_resumen_dom(page) -> dict:
@@ -607,6 +587,7 @@ async def _parse_resultado_licencia(page) -> dict:
     sin_info_registro = (
         "no se encontró información en el registro nacional de sanciones" in texto_lower
     )
+    tiene_cabecera_admin = "consulta del administrado" in texto_lower
 
     resumen_dom = await _parse_resumen_dom(page)
     resumen = resumen_dom or _parse_resumen(body_text)
@@ -626,8 +607,12 @@ async def _parse_resultado_licencia(page) -> dict:
         no_result = True
         captcha_valido = True
 
+    # Señal fuerte de submit exitoso, incluso cuando no hay filas en tablas.
+    if tiene_cabecera_admin:
+        captcha_valido = True
+
     # Si no hay resumen ni tablas, normalmente es submit fallido/captcha inválido
-    if not sin_info_registro and not tiene_resumen and not tabla_tramites and not tabla_bonif:
+    if not sin_info_registro and not tiene_resumen and not tabla_tramites and not tabla_bonif and not tiene_cabecera_admin:
         captcha_valido = False
 
     return {
@@ -889,26 +874,16 @@ async def consulta_licencia_por_nombre(ap_paterno: str, ap_materno: str, nombre:
     await inp_ape_mat.fill(ap_materno.strip().upper())
     await inp_nombre.fill(nombre.strip().upper())
 
-    async def _intentar_consulta(prefer_solver: str):
-        captcha_text = ""
-        captcha_solver = prefer_solver
+    async def _intentar_consulta():
+        captcha_solver = "capmonster"
 
         captcha_b64 = await _get_captcha_base64(page)
-        if prefer_solver == "openai":
-            captcha_text = _clean_6_digits(await _solve_captcha_strong(captcha_b64))
-        else:
-            tmp = await _solve_captcha_with_capmonster(captcha_b64)
-            if tmp and len(tmp) == 6:
-                captcha_text = tmp
-            else:
-                # Si CapMonster no devuelve 6 dígitos, fallback inmediato
-                captcha_solver = "openai"
-                captcha_text = _clean_6_digits(await _solve_captcha_strong(captcha_b64))
-
-        # Si no tenemos 6 dígitos, evitamos enviar el formulario (solo gastaría intento)
-        if len(captcha_text) != 6:
+        captcha_candidates = await _solve_captcha_candidates_with_capmonster(
+            captcha_b64, max_candidates=2
+        )
+        if not captcha_candidates:
             return {
-                "captcha_text": captcha_text,
+                "captcha_text": "",
                 "captcha_solver": captcha_solver,
                 "captcha_valido": False,
                 "tabla_tramites": [],
@@ -919,103 +894,53 @@ async def consulta_licencia_por_nombre(ap_paterno: str, ap_materno: str, nombre:
                 "body_text": "",
             }
 
-        captcha_input = page.locator("#txtCaptcha")
-        if not await captcha_input.count():
-            raise HTTPException(status_code=500, detail="Licencia: falta input de captcha")
+        last_result = None
+        last_text = ""
+        for captcha_text in captcha_candidates:
+            last_text = captcha_text
+            parsed = await _submit_captcha_y_parse(page, captcha_text)
+            last_result = parsed
+            if parsed["captcha_valido"]:
+                return {
+                    "captcha_text": captcha_text,
+                    "captcha_solver": captcha_solver,
+                    "captcha_valido": True,
+                    "tabla_tramites": parsed["tabla_tramites"],
+                    "tabla_bonif": parsed["tabla_bonif"],
+                    "resumen": parsed["resumen"],
+                    "no_result": parsed["no_result"],
+                    "mensaje_modal": parsed["mensaje_modal"],
+                    "body_text": parsed["body_text"],
+                }
 
-        await captcha_input.fill(captcha_text)
-
-        await _click_buscar(page)
-        try:
-            await page.wait_for_selector(
-                "#pnlAdministrado, #lblAdministrado, #ModalMensaje.show, #ModalMensaje.in, text=CONSULTA DEL ADMINISTRADO",
-                timeout=6000,
-            )
-        except Exception:
-            pass
-        mensaje_modal = await _leer_modal(page)
-        try:
-            tabla_tramites = await _extract_table(page, "#gbtramite")
-        except Exception:
-            tabla_tramites = []
-        try:
-            tabla_bonif = await _extract_table(page, "#gvBonificacion")
-        except Exception:
-            tabla_bonif = []
-
-        # Espera breve para que el DOM se actualice
-        await page.wait_for_timeout(350)
-        body_text = await page.inner_text("body")
-
-        texto_lower = body_text.lower()
-        no_result = "no se encontraron" in texto_lower
-
-        captcha_valido = True
-        for msg in [
-            "captcha incorrecto",
-            "código de seguridad incorrecto",
-            "ingrese el captcha",
-            "ingrese el código captcha",
-            "ingrese el codigo captcha",
-            "ingresar captcha",
-            "no coincide con la imagen",
-        ]:
-            if msg in texto_lower:
-                captcha_valido = False
-                break
-        if mensaje_modal:
-            mod_lower = mensaje_modal.lower()
-            if "captcha" in mod_lower and (
-                "incorrect" in mod_lower
-                or "inval" in mod_lower
-                or "no coincide" in mod_lower
-            ):
-                captcha_valido = False
-            if "ingrese" in mod_lower and "captcha" in mod_lower:
-                captcha_valido = False
-            if "ingrese" in mod_lower and "documento" in mod_lower:
-                captcha_valido = False
-
-        resumen_dom = await _parse_resumen_dom(page)
-        resumen = resumen_dom or _parse_resumen(body_text)
-        tiene_resumen = _tiene_resumen(resumen)
-        if tiene_resumen:
-            no_result = False
-            captcha_valido = True
-
-        sin_info_registro = "no se encontró información en el registro nacional de sanciones" in texto_lower
-        if sin_info_registro:
-            no_result = True
-            captcha_valido = True
-        # Si no detectamos datos y tampoco hay tablas, asumimos captcha malo
-        if not sin_info_registro and not tiene_resumen and not tabla_tramites and not tabla_bonif:
-            captcha_valido = False
-
+        parsed = last_result or {
+            "tabla_tramites": [],
+            "tabla_bonif": [],
+            "resumen": {},
+            "no_result": False,
+            "mensaje_modal": "",
+            "body_text": "",
+        }
         return {
-            "captcha_text": captcha_text,
+            "captcha_text": last_text,
             "captcha_solver": captcha_solver,
-            "captcha_valido": captcha_valido,
-            "tabla_tramites": tabla_tramites,
-            "tabla_bonif": tabla_bonif,
-            "resumen": resumen,
-            "no_result": no_result,
-            "mensaje_modal": mensaje_modal,
-            "body_text": body_text,
+            "captcha_valido": False,
+            "tabla_tramites": parsed["tabla_tramites"],
+            "tabla_bonif": parsed["tabla_bonif"],
+            "resumen": parsed["resumen"],
+            "no_result": parsed["no_result"],
+            "mensaje_modal": parsed["mensaje_modal"],
+            "body_text": parsed["body_text"],
         }
 
     resultado = None
-    solver_pref = (os.getenv("LICENCIA_CAPTCHA_SOLVER") or "openai").strip().lower()
-    # OpenAI es el más efectivo para este captcha; CapMonster queda como opción si quieres evitar OpenAI.
-    if solver_pref == "capmonster":
-        preferencias = ["capmonster", "capmonster", "openai"]
-    else:
-        preferencias = ["openai", "openai"]
-    for i, prefer in enumerate(preferencias):
-        resultado = await _intentar_consulta(prefer)
+    for intento in range(max(1, LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS)):
+        resultado = await _intentar_consulta()
         if resultado["captcha_valido"]:
             break
-        await _refresh_captcha(page)
-        await page.wait_for_timeout(600)
+        if intento < LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS - 1:
+            await _refresh_captcha(page)
+            await page.wait_for_timeout(600)
 
     await context.close()
 
@@ -1078,19 +1003,16 @@ async def consulta_licencia_por_dni(dni: str, browser):
 
     await inp_dni.fill(dni.strip())
 
-    async def _intentar_consulta(prefer_solver: str):
-        captcha_text = ""
-        captcha_solver = prefer_solver
+    async def _intentar_consulta():
+        captcha_solver = "capmonster"
 
         captcha_b64 = await _get_captcha_base64(page)
-        if prefer_solver == "openai":
-            captcha_text = _clean_6_digits(await _solve_captcha_strong(captcha_b64))
-        else:
-            captcha_text = (await _solve_captcha_with_capmonster(captcha_b64)) or ""
-
-        if len(captcha_text) != 6:
+        captcha_candidates = await _solve_captcha_candidates_with_capmonster(
+            captcha_b64, max_candidates=2
+        )
+        if not captcha_candidates:
             return {
-                "captcha_text": captcha_text,
+                "captcha_text": "",
                 "captcha_solver": captcha_solver,
                 "captcha_valido": False,
                 "tabla_tramites": [],
@@ -1101,117 +1023,53 @@ async def consulta_licencia_por_dni(dni: str, browser):
                 "body_text": "",
             }
 
-        captcha_input = page.locator("#txtCaptcha")
-        if not await captcha_input.count():
-            raise HTTPException(status_code=500, detail="Licencia: falta input de captcha")
+        last_result = None
+        last_text = ""
+        for captcha_text in captcha_candidates:
+            last_text = captcha_text
+            parsed = await _submit_captcha_y_parse(page, captcha_text)
+            last_result = parsed
+            if parsed["captcha_valido"]:
+                return {
+                    "captcha_text": captcha_text,
+                    "captcha_solver": captcha_solver,
+                    "captcha_valido": True,
+                    "tabla_tramites": parsed["tabla_tramites"],
+                    "tabla_bonif": parsed["tabla_bonif"],
+                    "resumen": parsed["resumen"],
+                    "no_result": parsed["no_result"],
+                    "mensaje_modal": parsed["mensaje_modal"],
+                    "body_text": parsed["body_text"],
+                }
 
-        await captcha_input.fill(captcha_text)
-        await _click_buscar(page)
-        try:
-            await page.wait_for_selector(
-                "#pnlAdministrado, #lblAdministrado, #ModalMensaje.show, #ModalMensaje.in, text=CONSULTA DEL ADMINISTRADO",
-                timeout=6000,
-            )
-        except Exception:
-            pass
-        mensaje_modal = await _leer_modal(page)
-
-        try:
-            tabla_tramites = await _extract_table(page, "#gbtramite")
-        except Exception:
-            tabla_tramites = []
-        try:
-            tabla_bonif = await _extract_table(page, "#gvBonificacion")
-        except Exception:
-            tabla_bonif = []
-
-        # Espera breve para que el DOM se actualice
-        await page.wait_for_timeout(350)
-        body_text = await page.inner_text("body")
-
-        texto_lower = body_text.lower()
-        no_result = "no se encontraron" in texto_lower
-
-        # Detectar errores de captcha (evita etiquetas genéricas)
-        captcha_valido = True
-        for msg in [
-            "captcha incorrecto",
-            "código de seguridad incorrecto",
-            "codigo de seguridad incorrecto",
-            "captcha inválido",
-            "captcha invalido",
-            "ingresar correctamente el captcha",
-            "ingrese el código captcha",
-            "ingrese el codigo captcha",
-            "no coincide con la imagen",
-        ]:
-            if msg in texto_lower:
-                captcha_valido = False
-                break
-        if mensaje_modal:
-            mod_lower = mensaje_modal.lower()
-            if "captcha" in mod_lower and (
-                "incorrect" in mod_lower
-                or "inval" in mod_lower
-                or "no coincide" in mod_lower
-            ):
-                captcha_valido = False
-            if "ingrese" in mod_lower and "captcha" in mod_lower:
-                captcha_valido = False
-            if "ingrese" in mod_lower and "documento" in mod_lower:
-                captcha_valido = False
-
-        resumen_dom = await _parse_resumen_dom(page)
-        resumen = resumen_dom or _parse_resumen(body_text)
-
-        tiene_resumen = _tiene_resumen(resumen)
-        if tiene_resumen:
-            no_result = False
-            captcha_valido = True
-
-        # Mensaje explícito: no hay info en el registro, pero captcha es válido
-        sin_info_registro = "no se encontró información en el registro nacional de sanciones" in texto_lower
-        if sin_info_registro:
-            no_result = True
-            captcha_valido = True
-
-        # Si no hay resumen ni tablas, o la página parece no haber aceptado el submit, forzamos reintento
-        if (
-            not sin_info_registro
-            and not tiene_resumen
-            and not tabla_tramites
-            and not tabla_bonif
-            and "ingrese número de documento" in texto_lower
-        ):
-            captcha_valido = False
-        if not sin_info_registro and not tiene_resumen and not tabla_tramites and not tabla_bonif:
-            captcha_valido = False
-
+        parsed = last_result or {
+            "tabla_tramites": [],
+            "tabla_bonif": [],
+            "resumen": {},
+            "no_result": False,
+            "mensaje_modal": "",
+            "body_text": "",
+        }
         return {
-            "captcha_text": captcha_text,
+            "captcha_text": last_text,
             "captcha_solver": captcha_solver,
-            "captcha_valido": captcha_valido,
-            "tabla_tramites": tabla_tramites,
-            "tabla_bonif": tabla_bonif,
-            "resumen": resumen,
-            "no_result": no_result,
-            "mensaje_modal": mensaje_modal,
-            "body_text": body_text,
+            "captcha_valido": False,
+            "tabla_tramites": parsed["tabla_tramites"],
+            "tabla_bonif": parsed["tabla_bonif"],
+            "resumen": parsed["resumen"],
+            "no_result": parsed["no_result"],
+            "mensaje_modal": parsed["mensaje_modal"],
+            "body_text": parsed["body_text"],
         }
 
-    solver_pref = (os.getenv("LICENCIA_CAPTCHA_SOLVER") or "openai").strip().lower()
-    if solver_pref == "capmonster":
-        preferencias = ["capmonster", "capmonster", "openai"]
-    else:
-        preferencias = ["openai", "openai"]
-
     resultado = None
-    for prefer in preferencias:
-        resultado = await _intentar_consulta(prefer)
+    for intento in range(max(1, LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS)):
+        resultado = await _intentar_consulta()
         if resultado["captcha_valido"]:
             break
-        await _refresh_captcha(page)
-        await page.wait_for_timeout(600)
+        if intento < LICENCIA_CAPTCHA_AUTO_MAX_ATTEMPTS - 1:
+            await _refresh_captcha(page)
+            await page.wait_for_timeout(600)
 
     await context.close()
 

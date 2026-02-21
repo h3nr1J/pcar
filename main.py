@@ -22,7 +22,7 @@ from services.licencia import (
     enviar_captcha_sesion_licencia,
     get_captcha_b64_sesion_licencia,
 )
-from services.sunarp import consulta_sunarp
+from services.sunarp import consulta_sunarp, enriquecer_resultado_sunarp_con_propietarios
 from services.sutran import consulta_sutran
 from services.redam import consulta_redam_dni
 from services.recompensas import (
@@ -43,6 +43,15 @@ LICENCIA_TIMEOUT_MS = int(os.getenv("LICENCIA_TIMEOUT_MS", "40000"))
 
 class ConsultaRequest(BaseModel):
     placa: str
+
+
+class ConsultaSunarpRequest(BaseModel):
+    placa: str
+    extraer_propietarios: bool = False
+
+
+class SunarpPropietariosRequest(BaseModel):
+    imagen_resultado_src: str = Field(..., min_length=20)
 
 
 class ConsultaVehicularFullRequest(BaseModel):
@@ -226,6 +235,25 @@ async def _wrap_servicio(nombre: str, fn, placa: str, browser):
         }
 
 
+async def _ensure_propietarios_sunarp(sunarp_res: dict | None) -> dict | None:
+    """
+    Completa propietarios desde la imagen SUNARP solo cuando hacen falta.
+    """
+    if not sunarp_res or not sunarp_res.get("ok"):
+        return sunarp_res
+
+    data = sunarp_res.get("data") or {}
+    if (data.get("propietarios_detalle") or []):
+        return sunarp_res
+
+    try:
+        data = await enriquecer_resultado_sunarp_con_propietarios(data)
+        sunarp_res["data"] = data
+    except Exception:
+        pass
+    return sunarp_res
+
+
 async def _wrap_recompensas(placa: str, browser, sunarp_res: dict | None):
     """
     Ejecuta recompensas intentando reutilizar propietarios de SUNARP si ya se consultó.
@@ -233,12 +261,19 @@ async def _wrap_recompensas(placa: str, browser, sunarp_res: dict | None):
     started = perf_counter()
     try:
         if sunarp_res and sunarp_res.get("ok"):
+            sunarp_res = await _ensure_propietarios_sunarp(sunarp_res)
             sunarp_data = sunarp_res.get("data") or {}
             propietarios = sunarp_data.get("propietarios_detalle") or []
-            data = await asyncio.wait_for(
-                consulta_recompensas_desde_propietarios(propietarios, browser),
-                timeout=RECOMPENSAS_TIMEOUT_MS / 1000,
-            )
+            if propietarios:
+                data = await asyncio.wait_for(
+                    consulta_recompensas_desde_propietarios(propietarios, browser),
+                    timeout=RECOMPENSAS_TIMEOUT_MS / 1000,
+                )
+            else:
+                data = await asyncio.wait_for(
+                    consulta_recompensas_desde_sunarp(placa, browser),
+                    timeout=RECOMPENSAS_TIMEOUT_MS / 1000,
+                )
         else:
             data = await asyncio.wait_for(
                 consulta_recompensas_desde_sunarp(placa, browser),
@@ -298,6 +333,7 @@ async def _wrap_licencia_desde_sunarp(sunarp_res: dict | None, browser):
     Ejecuta la consulta de licencia usando el primer propietario de SUNARP.
     """
     started = perf_counter()
+    sunarp_res = await _ensure_propietarios_sunarp(sunarp_res)
     propietario = _extraer_propietario_sunarp(sunarp_res)
     if not propietario:
         return {
@@ -352,6 +388,7 @@ async def _wrap_dni_nombre_desde_sunarp(sunarp_res: dict | None, browser):
     Obtiene un DNI consultando buscardniperu.com con el primer propietario de SUNARP.
     """
     started = perf_counter()
+    sunarp_res = await _ensure_propietarios_sunarp(sunarp_res)
     propietario = _extraer_propietario_sunarp(sunarp_res)
     if not propietario:
         return {
@@ -670,12 +707,42 @@ async def consulta_vehicular_full(req: ConsultaVehicularFullRequest):
 
 # -------- SUNARP --------
 @app.post("/consulta-vehicular")
-async def consulta_vehicular(req: ConsultaRequest):
+async def consulta_vehicular(req: ConsultaSunarpRequest):
     """
     Consulta vehicular en SUNARP.
+    Por defecto devuelve rápido (sin extraer propietarios de la imagen).
     """
     browser = app.state.browser
-    return await consulta_sunarp(req.placa, browser)
+    return await consulta_sunarp(
+        req.placa,
+        browser,
+        extraer_propietarios=req.extraer_propietarios,
+    )
+
+
+@app.post("/consulta-vehicular-propietarios")
+async def consulta_vehicular_propietarios(req: ConsultaRequest):
+    """
+    Consulta SUNARP y extrae propietarios desde la imagen (más lento que /consulta-vehicular).
+    """
+    browser = app.state.browser
+    return await consulta_sunarp(req.placa, browser, extraer_propietarios=True)
+
+
+@app.post("/sunarp-extraer-propietarios")
+async def sunarp_extraer_propietarios(req: SunarpPropietariosRequest):
+    """
+    Extrae propietarios desde una imagen SUNARP ya obtenida
+    (campo `imagen_resultado_src` del endpoint /consulta-vehicular).
+    """
+    data = await enriquecer_resultado_sunarp_con_propietarios(
+        {"imagen_resultado_src": req.imagen_resultado_src}
+    )
+    return {
+        "ok": True,
+        "propietarios": data.get("propietarios") or [],
+        "propietarios_detalle": data.get("propietarios_detalle") or [],
+    }
 
 @app.post("/consulta-vehicular-imagen")
 async def consulta_vehicular_imagen(req: ConsultaRequest):
@@ -798,7 +865,7 @@ async def consulta_sunarp_mas_licencia(req: ConsultaRequest):
     """
     browser = app.state.browser
 
-    sunarp_res = await consulta_sunarp(req.placa, browser)
+    sunarp_res = await consulta_sunarp(req.placa, browser, extraer_propietarios=True)
 
     # No hay propietarios detectados
     propietarios_det = sunarp_res.get("propietarios_detalle") or []

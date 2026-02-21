@@ -4,7 +4,7 @@ import io
 from fastapi import HTTPException
 from PIL import Image
 
-from services.sunarp import solve_captcha_with_openai
+from services.sunarp import solve_captcha_with_capmonster
 
 URL_REDAM = "https://casillas.pj.gob.pe/redam/#/"
 
@@ -60,7 +60,7 @@ async def consulta_redam_dni(dni: str, browser):
 
     # Captcha
     captcha_b64 = await _get_captcha_b64(page)
-    captcha_text = await solve_captcha_with_openai(captcha_b64)
+    captcha_text = await solve_captcha_with_capmonster(captcha_b64)
 
     captcha_input = page.locator("#captcha, input[ng-model*='captcha']")
     if not await captcha_input.count():

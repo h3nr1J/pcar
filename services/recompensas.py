@@ -158,7 +158,7 @@ async def consulta_recompensas_desde_sunarp(placa: str, browser):
     """
     Consulta SUNARP y usa el primer propietario detectado para buscar en recompensas.pe.
     """
-    sunarp_res = await consulta_sunarp(placa, browser)
+    sunarp_res = await consulta_sunarp(placa, browser, extraer_propietarios=True)
 
     propietarios = sunarp_res.get("propietarios_detalle") or []
     nombre_objetivo = ""
