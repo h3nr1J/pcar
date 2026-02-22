@@ -30,9 +30,9 @@ from services.recompensas import (
     consulta_recompensas_desde_sunarp,
     consulta_recompensas_desde_propietarios,
 )
-from services.redam import consulta_redam_dni
 from services.buscardniperu import consulta_dni_por_nombres
 from services.dniperu import consulta_dni_peru
+from services.sunat_ruc import consulta_sunat_ruc_por_nombre
 
 load_dotenv()
 
@@ -102,6 +102,16 @@ class DniNombreRequest(BaseModel):
 
 class DniPeruRequest(BaseModel):
     dni: str
+
+
+class SunatRucNombreRequest(BaseModel):
+    nombre: str | None = None
+    razon_social: str | None = None
+    nombre_razon_social: str | None = None
+
+    model_config = {
+        "extra": "ignore",
+    }
 
 
 @asynccontextmanager
@@ -938,6 +948,26 @@ async def consulta_dni_peru_endpoint(req: DniPeruRequest):
     """
     browser = app.state.browser
     return await consulta_dni_peru(req.dni, browser)
+
+
+@app.post("/consulta-ruc-nombre")
+@app.post("/consulta-sunat-ruc-nombre")
+async def consulta_ruc_nombre_endpoint(req: SunatRucNombreRequest):
+    """
+    Consulta SUNAT (e-consultaruc) por nombre o razon social y devuelve
+    los RUC encontrados en la relacion de contribuyentes.
+    """
+    nombre = (
+        (req.nombre or "").strip()
+        or (req.razon_social or "").strip()
+        or (req.nombre_razon_social or "").strip()
+    )
+    if not nombre:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe enviar nombre, razon_social o nombre_razon_social",
+        )
+    return await consulta_sunat_ruc_por_nombre(nombre)
 
 
 @app.get("/health")
