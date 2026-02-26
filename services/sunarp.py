@@ -25,6 +25,24 @@ _sunarp_extraer_propietarios = (
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+SUNARP_FORM_READY_TIMEOUT_MS = _env_int("SUNARP_FORM_READY_TIMEOUT_MS", 4500)
+SUNARP_TURNSTILE_HOOK_TIMEOUT_MS = _env_int("SUNARP_TURNSTILE_HOOK_TIMEOUT_MS", 5000)
+SUNARP_TURNSTILE_POST_SOLVE_WAIT_MS = _env_int("SUNARP_TURNSTILE_POST_SOLVE_WAIT_MS", 1200)
+SUNARP_SUBMIT_OUTCOME_TIMEOUT_MS = _env_int("SUNARP_SUBMIT_OUTCOME_TIMEOUT_MS", 12000)
+SUNARP_RESULT_IMAGE_TIMEOUT_MS = _env_int("SUNARP_RESULT_IMAGE_TIMEOUT_MS", 3500)
+SUNARP_PROPIETARIOS_MODEL = (os.getenv("SUNARP_PROPIETARIOS_MODEL") or "gpt-4o-mini").strip()
+
+
 def _get_openai_client() -> OpenAI | None:
     global _openai_client
     if _openai_client:
@@ -301,6 +319,32 @@ async def get_search_button(page):
     return None
 
 
+async def wait_search_form_ready(page, timeout_ms: int = SUNARP_FORM_READY_TIMEOUT_MS):
+    """
+    Espera de forma reactiva a que aparezca el formulario principal,
+    evitando sleeps fijos largos.
+    """
+    elapsed = 0
+    step = 250
+    selectors = [
+        "#nroPlaca",
+        "input[name='nroPlaca']",
+        "button.ant-btn.btn-sunarp-green.ant-btn-primary.ant-btn-lg",
+        "button:has-text('Realizar Busqueda')",
+        "button:has-text('Realizar Búsqueda')",
+    ]
+    while elapsed < timeout_ms:
+        for sel in selectors:
+            try:
+                if await page.locator(sel).count():
+                    return True
+            except Exception:
+                pass
+        await page.wait_for_timeout(step)
+        elapsed += step
+    return False
+
+
 async def wait_button_enabled(btn, page, timeout_ms: int = 12000):
     """
     Espera a que el botón no tenga disabled ni clase de loading/disabled.
@@ -321,6 +365,24 @@ async def wait_button_enabled(btn, page, timeout_ms: int = 12000):
         await page.wait_for_timeout(step)
         elapsed += step
     return False
+
+
+async def wait_result_image_src(page, timeout_ms: int = SUNARP_RESULT_IMAGE_TIMEOUT_MS):
+    """
+    Espera a que se pinte la tarjeta de resultado y devuelve el src en cuanto exista.
+    """
+    elapsed = 0
+    step = 250
+    while elapsed < timeout_ms:
+        try:
+            src = await get_result_image_src(page)
+        except Exception:
+            src = None
+        if src:
+            return src
+        await page.wait_for_timeout(step)
+        elapsed += step
+    return None
 
 
 async def wait_security_check(page, timeout_ms: int = 8000):
@@ -663,11 +725,27 @@ async def solve_turnstile_with_capmonster(page) -> str:
             detail="Falta CAPMONSTER_API_KEY para resolver Cloudflare Turnstile (carga el .env y reinicia la API)",
         )
 
-    # Preferir el sitekey/callback capturado por el hook (es lo más confiable para SUNARP)
-    hook = await _wait_for_turnstile_hook(page, timeout_ms=15000)
-    params = await _extract_turnstile_params(page)
+    # Esperar hook en paralelo mientras extraemos parámetros: evita bloquear
+    # innecesariamente cuando el sitekey ya está disponible.
+    hook_task = asyncio.create_task(
+        _wait_for_turnstile_hook(page, timeout_ms=SUNARP_TURNSTILE_HOOK_TIMEOUT_MS)
+    )
+    hook = await _get_turnstile_hook_info(page)
+    try:
+        params = await _extract_turnstile_params(page)
+    except Exception:
+        params = {}
+
     sitekey = hook.get("sitekey") or params.get("sitekey")
     if not sitekey:
+        try:
+            hook = await hook_task
+        except Exception:
+            hook = hook or {}
+        sitekey = hook.get("sitekey") or params.get("sitekey")
+    if not sitekey:
+        if not hook_task.done():
+            hook_task.cancel()
         raise HTTPException(status_code=500, detail="No se pudo obtener el sitekey de Turnstile")
 
     try:
@@ -700,7 +778,19 @@ async def solve_turnstile_with_capmonster(page) -> str:
         or ""
     )
     if not token:
+        if not hook_task.done():
+            hook_task.cancel()
         raise HTTPException(status_code=500, detail="CapMonster no devolvió token de Turnstile")
+
+    # Mientras CapMonster resolvía, el hook pudo capturar el callback.
+    # Le damos un margen corto adicional y luego aplicamos token.
+    if not hook_task.done() and SUNARP_TURNSTILE_POST_SOLVE_WAIT_MS > 0:
+        try:
+            await asyncio.wait_for(
+                hook_task, timeout=SUNARP_TURNSTILE_POST_SOLVE_WAIT_MS / 1000
+            )
+        except Exception:
+            hook_task.cancel()
 
     await _apply_turnstile_solution(page, token)
     return token
@@ -743,7 +833,7 @@ async def _remove_alert_overlays(page):
         pass
 
 
-async def _wait_sunarp_submit_outcome(page, timeout_ms: int = 15000):
+async def _wait_sunarp_submit_outcome(page, timeout_ms: int = SUNARP_SUBMIT_OUTCOME_TIMEOUT_MS):
     """
     Espera el resultado del submit:
     - si aparece modal "Captcha no resuelto"
@@ -904,7 +994,7 @@ async def extract_propietarios_from_image(image_b64: str) -> list[str]:
 
     def _call():
         resp = client.responses.create(
-            model="gpt-4.1-mini",
+            model=SUNARP_PROPIETARIOS_MODEL,
             input=[
                 {
                     "role": "user",
@@ -967,7 +1057,12 @@ async def extract_propietarios_from_image(image_b64: str) -> list[str]:
 
 # ============== FUNCIÓN PRINCIPAL ==============
 
-async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None = None):
+async def consulta_sunarp(
+    placa: str,
+    browser,
+    extraer_propietarios: bool | None = None,
+    incluir_imagen: bool = True,
+):
     """
     Hace TODO el flujo de SUNARP.
     Es básicamente tu antiguo endpoint /consulta-vehicular,
@@ -984,13 +1079,7 @@ async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None
 
     # 1) Ir a la página (SPA). Si vas directo a /inicio, devuelve 404; por eso usamos la raíz.
     await page.goto(URL, wait_until="domcontentloaded")
-    # Damos margen para que cargue Angular + Cloudflare y enrute a /inicio.
-    # El networkidle puede no disparar en SPAs con peticiones periódicas, así que lo hacemos best-effort.
-    try:
-        await page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(2000)
+    await wait_search_form_ready(page, timeout_ms=SUNARP_FORM_READY_TIMEOUT_MS)
 
     # 2) Rellenar placa
     placa = placa.strip().upper()
@@ -1041,7 +1130,9 @@ async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None
             await _close_sunarp_captcha_modal(page)
             await btn.click(force=True)
 
-        outcome, resp = await _wait_sunarp_submit_outcome(page, timeout_ms=15000)
+        outcome, resp = await _wait_sunarp_submit_outcome(
+            page, timeout_ms=SUNARP_SUBMIT_OUTCOME_TIMEOUT_MS
+        )
         if outcome == "response":
             # SUNARP puede responder 200 pero indicar "Token Captcha Invalido"
             try:
@@ -1073,15 +1164,13 @@ async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None
     body_text = ""
     result_img_src = None
     try:
-        await page.wait_for_timeout(2500)
         await _close_sunarp_captcha_modal(page)
         await _remove_alert_overlays(page)
-        body_text = await page.inner_text("body")
-        result_img_src = await get_result_image_src(page)
+        result_img_src = await wait_result_image_src(page, timeout_ms=SUNARP_RESULT_IMAGE_TIMEOUT_MS)
         if not result_img_src:
-            await page.wait_for_timeout(2000)
             await _remove_alert_overlays(page)
             result_img_src = await get_result_image_src(page)
+        body_text = await page.inner_text("body")
     except Exception:
         pass
 
@@ -1111,7 +1200,7 @@ async def consulta_sunarp(placa: str, browser, extraer_propietarios: bool | None
         "captcha_detectado": captcha_text or turnstile_token or None,
         "captcha_valido": True,
         "resultado_crudo": body_text,
-        "imagen_resultado_src": result_img_src,
+        "imagen_resultado_src": result_img_src if incluir_imagen else None,
         "propietarios": propietarios,
         "propietarios_detalle": propietarios_detalle,
         "propietarios_extraidos": should_extract_propietarios,

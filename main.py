@@ -2,11 +2,14 @@
 import os
 import asyncio
 import base64
+from datetime import datetime, timezone
 from time import perf_counter
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -39,6 +42,7 @@ load_dotenv()
 SERVICE_TIMEOUT_MS = int(os.getenv("SERVICE_TIMEOUT_MS", "20000"))
 RECOMPENSAS_TIMEOUT_MS = int(os.getenv("RECOMPENSAS_TIMEOUT_MS", "25000"))
 LICENCIA_TIMEOUT_MS = int(os.getenv("LICENCIA_TIMEOUT_MS", "40000"))
+SUNARP_ASYNC_JOB_TTL_SEC = int(os.getenv("SUNARP_ASYNC_JOB_TTL_SEC", "600"))
 
 
 class ConsultaRequest(BaseModel):
@@ -48,6 +52,13 @@ class ConsultaRequest(BaseModel):
 class ConsultaSunarpRequest(BaseModel):
     placa: str
     extraer_propietarios: bool = False
+    incluir_imagen: bool = True
+
+
+class ConsultaSunarpAsyncRequest(BaseModel):
+    placa: str
+    extraer_propietarios: bool = True
+    incluir_imagen: bool = False
 
 
 class SunarpPropietariosRequest(BaseModel):
@@ -128,6 +139,8 @@ async def lifespan(app: FastAPI):
 
     app.state.pw = pw
     app.state.browser = browser
+    app.state.sunarp_jobs = {}
+    app.state.sunarp_jobs_lock = asyncio.Lock()
     try:
         yield
     finally:
@@ -145,6 +158,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 SERVICIOS_VEHICULARES = {
     "sunarp": consulta_sunarp,
@@ -206,6 +220,76 @@ def _normalizar_servicios(lista: list[str] | None) -> list[str]:
             detail=f"Servicios no soportados: {', '.join(invalidos)}",
         )
     return normalizados
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _cleanup_sunarp_jobs(app: FastAPI):
+    jobs = app.state.sunarp_jobs
+    lock = app.state.sunarp_jobs_lock
+    now_ts = datetime.now(timezone.utc).timestamp()
+    async with lock:
+        to_delete = []
+        for job_id, job in jobs.items():
+            expires_at = job.get("expires_at_ts")
+            if expires_at and expires_at <= now_ts:
+                to_delete.append(job_id)
+        for job_id in to_delete:
+            jobs.pop(job_id, None)
+
+
+async def _run_sunarp_async_job(app: FastAPI, job_id: str):
+    jobs = app.state.sunarp_jobs
+    lock = app.state.sunarp_jobs_lock
+
+    async with lock:
+        job = jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["updated_at"] = _utc_iso_now()
+        placa = job["placa"]
+        extraer_propietarios = bool(job["extraer_propietarios"])
+        incluir_imagen = bool(job["incluir_imagen"])
+
+    started = perf_counter()
+    status_code = 200
+    result_data = None
+    error = None
+    ok = False
+    try:
+        result_data = await consulta_sunarp(
+            placa,
+            app.state.browser,
+            extraer_propietarios=extraer_propietarios,
+            incluir_imagen=incluir_imagen,
+        )
+        ok = True
+    except HTTPException as e:
+        status_code = e.status_code
+        error = e.detail
+    except Exception as e:
+        status_code = 500
+        error = str(e)
+
+    finished_at = datetime.now(timezone.utc)
+    expires_at = finished_at.timestamp() + SUNARP_ASYNC_JOB_TTL_SEC
+    async with lock:
+        job = jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "done"
+        job["ok"] = ok
+        job["status_code"] = status_code
+        job["error"] = error
+        job["duracion_ms"] = int((perf_counter() - started) * 1000)
+        job["updated_at"] = finished_at.isoformat()
+        job["expires_at"] = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+        job["expires_at_ts"] = expires_at
+        if ok:
+            job["data"] = result_data
 
 
 async def _wrap_servicio(nombre: str, fn, placa: str, browser):
@@ -727,7 +811,59 @@ async def consulta_vehicular(req: ConsultaSunarpRequest):
         req.placa,
         browser,
         extraer_propietarios=req.extraer_propietarios,
+        incluir_imagen=req.incluir_imagen,
     )
+
+
+@app.post("/consulta-vehicular-async")
+async def consulta_vehicular_async(req: ConsultaSunarpAsyncRequest):
+    """
+    Encola la consulta SUNARP y responde de inmediato con job_id para polling.
+    """
+    await _cleanup_sunarp_jobs(app)
+    job_id = uuid4().hex
+    now = _utc_iso_now()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "ok": None,
+        "status_code": None,
+        "error": None,
+        "duracion_ms": None,
+        "placa": req.placa.strip().upper(),
+        "extraer_propietarios": bool(req.extraer_propietarios),
+        "incluir_imagen": bool(req.incluir_imagen),
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": None,
+        "expires_at_ts": None,
+    }
+    async with app.state.sunarp_jobs_lock:
+        app.state.sunarp_jobs[job_id] = job
+
+    asyncio.create_task(_run_sunarp_async_job(app, job_id))
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "queued",
+        "poll_endpoint": f"/consulta-vehicular-async/{job_id}",
+    }
+
+
+@app.get("/consulta-vehicular-async/{job_id}")
+async def consulta_vehicular_async_status(job_id: str):
+    """
+    Estado de una consulta SUNARP asíncrona.
+    """
+    await _cleanup_sunarp_jobs(app)
+    async with app.state.sunarp_jobs_lock:
+        job = app.state.sunarp_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job_id no encontrado o expirado")
+        out = dict(job)
+
+    out.pop("expires_at_ts", None)
+    return out
 
 
 @app.post("/consulta-vehicular-propietarios")
